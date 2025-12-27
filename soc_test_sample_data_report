@@ -1,0 +1,863 @@
+---
+title: "SoC Test Sample Data Analysis Report"
+author: "Your name"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  html_document:
+    df_print: paged
+fontsize: 11pt
+# geometry: margin=0.8in
+---
+
+```{r setup, include=FALSE}
+
+# knitr::opts_chunk$set(echo = TRUE)
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(janitor)
+library(ggplot2)
+
+```
+
+## Data Source
+
+<https://awakenology.org/SoC-AssessPoints-Test-Sample-Data/>
+
+```{r cars}
+## 1. Inputs & Assumptions
+
+file_path <- "SoC_Test_Sample_Data_English_20190317.xlsx"
+
+# IMPORTANT: item scale range (change these if not 0-100)
+
+scale_min <- 0
+scale_max <- 100
+
+area_sheets <- paste0(" Sheet", 1:9)
+summary_sheet <- " Summary"
+
+```
+
+```{r pressure, echo=FALSE}
+## 2.1 Identify experimenter columns
+
+get_experiment_cols <- function(df) {
+cols <- names(df)
+cols[str_detect(cols, regex("Experiment", ignore_case = TRUE))]
+}
+
+extract_person_id <- function(colname) {
+
+# expected pattern: "... 14" at end
+
+x <- str_extract(colname, "\\d+\\s*$")
+as.integer(str_trim(x))
+}
+
+# 2.2 Identify inverse flag column (subitem-level)
+# This tries to detect a column whose name contains “inverse” (case-insensitive).
+
+guess_inverse_col <- function(df) {
+cols <- names(df)
+inv <- cols[str_detect(cols, regex("inverse", ignore_case = TRUE))]
+if (length(inv) == 0) return(NA_character_)
+if (length(inv) > 1) {
+message("Multiple inverse-like columns found: ", paste(inv, collapse = ", "),
+". Using the first: ", inv[1])
+}
+inv[1]
+}
+
+# 2.3 Drop derived/summary rows
+# We remove any row where the first column contains “Comprehensive” (sheet-level summary rows).
+
+drop_summary_rows <- function(df) {
+first_col <- names(df)[1]
+df %>%
+filter(!str_detect(as.character(.data[[first_col]]),
+regex("Comprehensive", ignore_case = TRUE)))
+}
+
+# 2.4 Convert numeric safely & apply item inverse
+
+to_numeric_cols <- function(df, cols) {
+df %>%
+mutate(across(all_of(cols), ~ suppressWarnings(as.numeric(.x))))
+}
+
+reverse_code <- function(x, minv = 0, maxv = 100) {
+
+# general reverse coding: min+max - x
+
+(minv + maxv) - x
+}
+
+```
+
+```{r}
+# 3. Read SoC (Summary sheet)
+# 
+# We extract SoC values from the Summary sheet.
+# (If the rows/cols shift in another version of the file, adjust the slice/select lines.)
+
+summary_raw <- read_excel(file_path, sheet = 1)
+
+# NOTE: adjust rows/cols if needed
+
+soc_table <- summary_raw %>%
+slice(10:18) %>%          # <- if shifts, change here
+select(1:3) %>%           # <- if shifts, change here
+setNames(c("Experimenter", "SoC_level", "Accuracy")) %>%
+mutate(
+Person = as.integer(str_extract(as.character(Experimenter), "\\d+$")),
+SoC_level = as.numeric(SoC_level)
+) %>%
+filter(!is.na(Person))
+
+# soc_table
+
+```
+
+```{r}
+# 4. Read & Clean Area Sheets → Item-level Long Table
+# 4.1 Core idea
+
+# For each Area sheet:
+# Detect experiment columns
+# Detect inverse flag column (if exists)
+# Drop "Comprehensive" summary rows
+# Keep: Item label + inverse flag + experiment columns
+# Pivot longer to item × person
+# Apply item-level reverse coding if Inverse_item == TRUE
+
+item_long <- purrr::map_dfr(area_sheets, function(sh) {
+
+  df <- readxl::read_excel(file_path, sheet = sh)
+
+  # inverse：last col header is a number
+  inverse_col_name <- names(df)[ncol(df)]
+  has_inverse <- stringr::str_detect(inverse_col_name, "^\\d+$")
+
+  df <- df %>%
+    dplyr::mutate(
+      Inverse_item = if (has_inverse) {
+        !is.na(.data[[inverse_col_name]])
+      } else {
+        FALSE
+      }
+    )
+
+  if (has_inverse) {
+    df <- df %>% dplyr::select(-any_of(inverse_col_name))
+  }
+
+  df <- df %>%
+    drop_summary_rows() %>%
+    dplyr::rename(Item = 1)
+
+  exp_cols <- names(df)[stringr::str_detect(names(df), "^Experiment")]
+
+  if (length(exp_cols) == 0) {
+    stop("No Experiment columns detected in ", sh)
+  }
+
+  df <- df %>% dplyr::select(Item, Inverse_item, all_of(exp_cols))
+  
+  # manually correct a inverse value worng inputs
+
+df <- df %>%
+  mutate(Area_num = as.integer(stringr::str_extract(sh, "\\d+$")),
+    Inverse_item = if_else(
+      Area_num == 4 & Inverse_item == TRUE,
+      FALSE,
+      Inverse_item
+    )
+  )
+
+df <- df %>%
+  dplyr::mutate(
+    Item = stringr::str_squish(Item)
+  )
+
+df <- df %>%
+  dplyr::mutate(
+    Inverse_item = dplyr::if_else(
+      Item == "9th Chakra (between throat and heart)",
+      TRUE,
+      Inverse_item
+    )
+  )
+
+# df <- df %>%
+#   group_by(Item) %>%
+#   mutate(
+#     max_obs = max(Value_raw, na.rm = TRUE),
+#     Value_scaled = if_else(
+#       max_obs > 100,
+#       Value_raw / max_obs * 100,
+#       Value_raw
+#     )
+#   ) %>%
+#   ungroup()
+
+# df <- df %>%
+#   dplyr::mutate(across(all_of(exp_cols), as.character))
+# 
+#   out <- df %>%
+#     tidyr::pivot_longer(
+#       cols = all_of(exp_cols),
+#       names_to = "Experimenter",
+#       values_to = "Value_raw"
+#     ) %>%
+#     dplyr::mutate(
+#       Value_raw = suppressWarnings(as.numeric(Value_scaled)),
+#       Area = sh,
+#       Area_num = as.integer(stringr::str_extract(sh, "\\d+$")),
+#       Person = purrr::map_int(Experimenter, extract_person_id),
+#       Value_adj = if_else(
+#         Inverse_item & !is.na(Value_raw),  
+#         reverse_code(Value_raw, scale_min, scale_max),
+#         Value_raw
+#       )
+#     )
+# 
+#   out
+# })
+
+out <- df %>%
+  dplyr::mutate(across(all_of(exp_cols), as.character)) %>%
+  tidyr::pivot_longer(
+    cols = all_of(exp_cols),
+    names_to = "Experimenter",
+    values_to = "Value_raw"
+  ) %>%
+  dplyr::mutate(
+    Value_raw = suppressWarnings(as.numeric(Value_raw)),
+    Area = sh,
+    Area_num = as.integer(stringr::str_extract(sh, "\\d+$")),
+    Person = purrr::map_int(Experimenter, extract_person_id)
+  ) %>%
+  group_by(Item) %>%
+  dplyr::mutate(
+    max_obs = max(Value_raw, na.rm = TRUE),
+    Value_raw = dplyr::if_else(
+      max_obs > 100,
+      Value_raw / max_obs * 100,
+      Value_raw
+    )
+  ) %>%
+  ungroup() %>%
+  dplyr::mutate(
+    Value_adj = dplyr::if_else(
+      Inverse_item & !is.na(Value_raw),
+      100 - Value_raw,
+      Value_raw
+    )
+  )
+  out
+})
+
+  # table(item_long$Inverse_item, item_long$Area_num, useNA = "ifany")
+```
+
+## Before you proceed
+
+All score values in this report are presented on a 0–100 scale. Value_raw refers to the originally reported item values, while Value_adj represents adjusted scores after accounting for inverse scoring in Areas 1, 5, and 6.
+
+For Area 4, two items—(1) Potential to Exceed Innate Limitations and (2) Degree of Exceeding Innate Boundaries—have comprehensive scores that can exceed 100 in their original form. To ensure comparability across items and areas, these scores were rescaled to a 0–100 range based on the observed maximum within the sample.
+
+```{r}
+# 5. QC Checks (Data sanity)
+# 5.1 Unparsed person IDs?
+
+bad_pid <- item_long %>%
+filter(is.na(Person)) %>%
+distinct(Experimenter)
+
+# bad_pid
+
+# 5.2 How many inverse items per area?  
+  
+inverse_by_area <- item_long %>%
+distinct(Area, Area_num, Item, Inverse_item) %>%
+group_by(Area, Area_num) %>%
+summarise(
+n_items = n(),
+n_inverse_items = sum(Inverse_item),
+pct_inverse = n_inverse_items / n_items,
+.groups = "drop"
+) %>%
+arrange(Area_num)
+
+# inverse_by_area
+
+  
+```
+
+## Summary in tables and plots
+
+```{r}
+# 6. Area-level summaries (Raw vs Adjusted)
+# 6.1 Person × Area mean (raw/adjusted)
+
+area_person <- item_long %>%
+group_by(Person, Area, Area_num) %>%
+summarise(
+mean_raw = mean(Value_raw, na.rm = TRUE),
+mean_adj = mean(Value_adj, na.rm = TRUE),
+n_items = n(),
+n_nonmiss_raw = sum(!is.na(Value_raw)),
+n_nonmiss_adj = sum(!is.na(Value_adj)),
+.groups = "drop"
+)
+
+# area_person
+
+# 6.2 Area summary table (across persons)
+# Also compute measurement weight: AssessPoints n (%).
+
+assesspoints <- item_long %>%
+distinct(Area, Area_num, Item) %>%
+count(Area, Area_num, name = "AssessPoints_n")
+
+total_points <- sum(assesspoints$AssessPoints_n)
+
+area_table <- area_person %>%
+group_by(Area, Area_num) %>%
+summarise(
+Raw_Mean = mean(mean_raw, na.rm = TRUE),
+Adj_Mean = mean(mean_adj, na.rm = TRUE),
+SD_Raw = sd(mean_raw, na.rm = TRUE),
+SD_Adj = sd(mean_adj, na.rm = TRUE),
+n_persons = sum(!is.na(mean_raw)),
+.groups = "drop"
+) %>%
+left_join(assesspoints, by = c("Area","Area_num")) %>%
+mutate(
+AssessPoints_pct = AssessPoints_n / total_points,
+AssessPoints_n_pct = paste0(AssessPoints_n, " (", round(100*AssessPoints_pct, 1), "%)")
+) %>%
+arrange(desc(Adj_Mean))
+
+# area_table
+
+area_table <- area_table %>%
+  arrange(desc(Adj_Mean)) %>%
+  mutate(Rank = row_number())
+
+focus_map <- tibble(
+  Area_num = 1:9,
+  Developmental_Focus = c(
+    "Identity Stability (Inverse)",
+    "Autonomous Consciousness",
+    "Spiritual Connection",
+    "Thought Expansion",
+    "Old Inertia (Inverse)",
+    "Structural Rigidity (Inverse)",
+    "Spiritual Exchange",
+    "Spiritual Structure",
+    "Module Exchange"
+  )
+)
+
+area_table <- area_table %>%
+  left_join(focus_map, by = "Area_num")
+
+final_table <- area_table %>%
+  select(
+    Rank,
+    Area = Area_num,
+    Developmental_Focus,
+    Raw_Mean,
+    Aligned_Mean = Adj_Mean,
+    Std_Dev = SD_Adj,
+    # `Assessment Points n (%)` = AssessPoints_n_pct
+  )
+
+# final_table
+knitr::kable(
+  final_table,
+  digits = 2,
+  caption = "Summary of SOC levels by area")
+
+
+```
+
+This table summarizes the average SOC level for each area across all subjects, ranked from highest to lowest based on the aligned mean score.
+
+The table reports both Raw Mean and Aligned Mean. Raw Mean is the original average score. Aligned Mean adjusts the direction of some areas so that higher values always represent higher SOC. Areas labeled “Inverse” are those where higher raw scores originally reflected the opposite direction, so they were reversed to make all areas comparable on the same scale.
+
+The top-ranked area is Area 5 (Old Inertia, Inverse), with the highest aligned mean (81.46) and the largest number of assessment points. This suggests consistently high scores in this area after alignment.
+
+The bottom-ranked area is Area 1 (Identity Stability, Inverse), which has the lowest aligned mean (75.84). It also shows the largest standard deviation (11.76), indicating the greatest variability in scores across subjects compared to other areas.
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(scales)
+
+df_pie <- area_table %>%
+  mutate(
+    Area_num = factor(Area_num, levels = 1:9),
+    label_npct = paste0(
+      AssessPoints_n, " (",
+      percent(AssessPoints_pct, accuracy = 0.1), ")"
+    )
+  )
+
+# ggplot(df_pie, aes(x = "", y = AssessPoints_pct, fill = Area_num)) +
+#   geom_col(width = 1, color = "white") +
+#   coord_polar(theta = "y") +
+#   geom_text(
+#     aes(label = label_npct),
+#     position = position_stack(vjust = 0.5),
+#     size = 4
+#   ) +
+#   labs(
+#     title = "Assessment Points Distribution (Area 1–9)",
+#     fill = "Area"
+#   ) +
+#   theme_void()
+
+library(ggplot2)
+library(treemapify)
+
+library(dplyr)
+
+df_pie <- df_pie %>%
+  mutate(
+    Area_label = paste0(
+      "Area ", Area_num, "\n",
+      AssessPoints_n_pct, " (", Developmental_Focus, ")"
+    )
+  )
+
+
+library(ggplot2)
+library(treemapify)
+library(scales)
+
+ggplot(
+  df_pie,
+  aes(
+    area  = AssessPoints_n,
+    fill  = factor(Area_num),
+    label = Area_label
+  )
+) +
+  geom_treemap(color = "white", size = 0.8) +
+
+  geom_treemap_text(
+    colour = "white",
+    fontface = "bold",
+    place = "centre",
+    grow = FALSE,
+    reflow = TRUE,
+    min.size = 4
+  ) +
+
+  scale_fill_manual(
+    values = c(
+      "#4E79A7", "#59A14F", "#F28E2B",
+      "#E15759", "#76B7B2", "#EDC948",
+      "#B07AA1", "#FF9DA7", "#9C755F"
+    )
+  ) +
+
+  labs(
+    title = "Assess Points Distribution (Area 1–9)"
+  ) +
+
+  theme_void() +
+  theme(
+    plot.title = element_text(
+      size = 16,
+      face = "bold",
+      hjust = 0.5
+    ),
+    legend.position = "none"  
+  )
+
+
+```
+
+There is a total of 265 assess points are distributed across areas. The distribution is uneven: Area 5 (Old Inertia, Inverse), Area 6 (Structural Rigidity, Inverse), and Area 9 (Module Exchange) together account for about 56% of all assess points.
+
+```{r}
+# 7. Alignment with SoC (Raw vs Adjusted)
+# This is where we quantify direction (positive vs negative alignment).
+# We compute correlations between person-area means and SoC.
+
+area_soc <- area_person %>%
+left_join(soc_table %>% select(Person, SoC_level), by = "Person")
+
+align_table <- area_soc %>%
+group_by(Area, Area_num) %>%
+summarise(
+n = sum(!is.na(SoC_level) & !is.na(mean_raw)),
+corr_raw = cor(mean_raw, SoC_level, use = "complete.obs"),
+corr_adj = cor(mean_adj, SoC_level, use = "complete.obs"),
+.groups = "drop"
+) %>%
+arrange(desc(abs(corr_adj)))
+
+# align_table
+
+```
+
+```{r}
+# 8. Cluster / Pattern: Area–Area relationships
+# We compute Area–Area correlation matrix using adjusted person-area means (recommended when subitems include inverse).
+
+mat_adj <- area_soc %>%
+select(Person, Area_num, mean_adj) %>%
+pivot_wider(names_from = Area_num, values_from = mean_adj) %>%
+arrange(Person)
+
+area_corr_adj <- mat_adj %>%
+select(-Person) %>%
+cor(use = "pairwise.complete.obs")
+
+# area_corr_adj
+
+```
+
+```{r}
+# 9. Visuals
+# 9.1 Alignment bar plot (adjusted)
+
+library(dplyr)
+library(ggplot2)
+
+align_plot_df <- align_table %>%
+  mutate(
+    sign = if_else(corr_raw >= 0, "Positive", "Negative"),
+    corr_label = sprintf("%.2f", corr_raw)
+  )
+
+ggplot(
+  align_plot_df,
+  aes(
+    x = paste0("Area", Area_num),
+    y = corr_raw,
+    fill = sign
+  )
+) +
+  geom_col(width = 0.7) +
+
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    color = "grey50",
+    linewidth = 0.6
+  ) +
+
+  geom_text(
+    aes(
+      label = corr_label,
+      vjust = if_else(corr_raw >= 0, -0.4, 1.3)
+    ),
+    size = 4,
+    fontface = "bold",
+    color = "grey20"
+  ) +
+
+  scale_fill_manual(
+    values = c(
+      "Positive" = "#4E79A7",  
+      "Negative" = "#E15759"   
+    )
+  ) +
+
+  labs(
+    x = "",
+    y = "Correlation (Area mean_adj vs SoC)",
+    title = "Area–SoC Alignment",
+    fill = NULL
+  ) +
+
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      hjust = 0.5
+    ),
+    panel.grid.minor = element_blank(),
+    legend.position = "right"
+  )
+
+
+```
+
+All areas are highly correlated with SOC，indicating that individuals with higher scores in a given area also tend to have higher SoC, and vice versa. Areas 1, 5, and 6 are negatively correlated simply because they’re measured in the reverse direction, not because they behave differently.
+
+```{r}
+
+# 9.3 Per-person profile (spaghetti)
+
+sp <- item_long %>%
+  dplyr::group_by(Person, Area_num) %>%
+  dplyr::summarise(
+    mean_raw = mean(Value_raw, na.rm = TRUE),
+    mean_adj = mean(Value_adj, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+sp <- sp %>%
+  dplyr::left_join(
+    soc_table %>% dplyr::select(Person, SoC_level),
+    by = "Person"
+  )
+
+sp <- sp %>%
+  dplyr::mutate(
+    person_soc = paste0(Person, " (", SoC_level, ")")
+  )
+
+
+soc_palette <- c(
+  "#4E79A7", "#59A14F", "#F28E2B",
+  "#E15759", "#76B7B2", "#EDC948",
+  "#B07AA1", "#FF9DA7", "#9C755F"
+)
+
+sp$SoC_level_num <- as.numeric(sp$SoC_level)
+
+sp$SoC_level_num <- factor(
+  sp$SoC_level_num,
+  levels = sort(unique(sp$SoC_level_num))
+)
+
+
+ggplot(sp, aes(
+  x = Area_num,
+  y = mean_adj,
+  group = person_soc,
+  color = factor(person_soc)
+)) +
+  geom_line(
+    linewidth = 0.9,
+    alpha = 0.75
+  ) +
+  geom_point(
+    size = 2,
+    alpha = 0.85
+  ) +
+  scale_color_manual(
+    values = soc_palette,
+    name = "Person（SoC）"
+  ) +
+  scale_x_continuous(
+    breaks = 1:9
+  ) +
+  labs(
+    x = "Area",
+    y = "Adjusted mean",
+    title = "Per-person Area Profiles by SOC"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      hjust = 0.5
+    ),
+    panel.grid.minor = element_blank(),
+    legend.position = "right"
+  )
+
+
+```
+
+This line graph does not show trends over time. Instead, it shows the level of adjusted scores across areas for each person, allowing comparison of how scores are distributed within and across individuals.
+
+For example, Subject 1, who has the highest SOC level, also shows the highest scores overall. Their strongest area is Area 1, while their lower values appear around Areas 9. Even so, their scores remain within a relatively narrow range (roughly 90–100), indicating a fairly balanced profile across areas.
+
+In contrast, Subject 11 shows a noticeably lower score in Area 1, even lower than Subject 4, whose SOC level is 6.4. This is notable because Subject 11’s average SOC is higher (8.6), showing that area-level scores do not always scale directly with overall SOC.
+
+Except for Subject 1, across nearly all available data points, Areas 6-9 tend to fall on the lower end of scores for most subjects, suggesting these areas consistently show relatively lower values within individual profiles.
+
+```{r}
+sp_rank <- sp %>%
+  group_by(person_soc) %>%
+  mutate(
+    area_rank = rank(-mean_adj, ties.method = "average"),
+    area_rank_f = factor(
+      area_rank,
+      levels = 1:9,
+      ordered = TRUE
+    )
+  ) %>%
+  ungroup()
+
+
+library(ggplot2)
+library(viridis)
+
+
+
+# scale_fill_manual(
+#   values = c(
+#     "#1c2d3a",
+#     "#2f4454",
+#     "#4a6572",
+#     "#6f8f9c",
+#     "#9bb1bc",
+#     "#c3d1d8",
+#     "#dde5ea",
+#     "#f0f4f6",
+#     "#fafcfd"
+#   ),
+#   name = "Rank\n(1 = highest)"
+# )
+
+# scale_fill_manual(
+#   values = c(
+#     "#1f3b4d",  # rank 1  
+#     "#2f5d8a",
+#     "#4f7fb3",
+#     "#8faad1",
+#     "#cfd8e3",  
+#     "#e6cfcf",
+#     "#d99a9a",
+#     "#b85c5c",
+#     "#7f1d1d"   # rank 9  
+#   ),
+#   name = "Rank\n(1 = highest)"
+# )
+
+ggplot(sp_rank, aes(
+  x = factor(Area_num),
+  y = factor(person_soc),
+  fill = area_rank_f
+)) +
+  geom_tile(color = "white", linewidth = 0.4) +
+scale_fill_manual(
+  values = c(
+    "#2b2d42",  
+    "#3a5a7a",
+    "#5f8fa3",
+    "#a9c5cf",
+    "#e5e5e5",  
+    "#cdb4db",
+    "#9a7fbf",
+    "#6a4c93",
+    "#3c096c"   
+  ),
+  name = "Rank\n(1 = highest)"
+) +
+  labs(
+    x = "Area",
+    y = "Person (SOC)",
+    title = "Per-person Area Rank Profiles"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+
+
+```
+
+Similarly, this heatmap shows the relative score ranking of each area within each person. For Subjects 12–15, complete data were only available for Areas 1–5, which is why Areas 6–9 are blank for those individuals.
+
+Despite this, a consistent pattern is still visible: most subjects have their highest-ranked scores in Area 5, while Areas 6–9 generally fall toward the lower end of the rankings when data are available. In addition, Areas 3 and 4 also tend to rank relatively high across individuals.
+
+```{r}
+
+sp %>%
+  group_by(person_soc) %>%
+  summarise(
+    max_area = Area_num[which.max(mean_adj)],
+    min_area = Area_num[which.min(mean_adj)],
+    gap = max(mean_adj) - min(mean_adj)
+  ) %>% 
+    knitr::kable(
+    digits = 2,
+    caption = "Within-person area contrast (max–min gap)"
+  )
+
+```
+
+This table shows each subject’s highest- and lowest-scoring areas and the gap between them. Subjects 11 and 12 stand out with noticeably larger gaps. This naturally leads to the next question: which specific assess points drive these extremes, and are there any shared patterns across individuals?
+
+```{r}
+gap_df <- sp %>%
+  group_by(Person) %>%
+  summarise(
+    max_area = Area_num[which.max(mean_adj)],
+    min_area = Area_num[which.min(mean_adj)],
+    gap = max(mean_adj) - min(mean_adj)
+  )
+
+sp_extreme <- item_long %>%
+  inner_join(gap_df, by = "Person")
+
+top_items <- sp_extreme %>%
+  filter(Area_num == max_area) %>%
+  group_by(Person) %>%
+  slice_max(Value_adj, n = 1, with_ties = FALSE) %>%
+  select(Person, Area_num, Item, Value_adj, Value_raw )
+
+bottom_items <- sp_extreme %>%
+  filter(Area_num == min_area) %>%
+  group_by(Person) %>%
+  slice_min(Value_adj, n = 1, with_ties = FALSE) %>%
+  select(Person, Area_num, Item, Value_adj, Value_raw)
+
+# top_items
+# bottom_items
+  knitr::kable(top_items,
+    digits = 2,
+    caption = "Top Item per Individual"
+  )
+  
+    knitr::kable(bottom_items,
+    digits = 2,
+    caption = "Bottom Item per Individual"
+  )
+
+```
+
+At the item level, there isn’t much overlap in the exact assessment points driving the highest areas — different people tend to peak on different items, similarly for the lower end. One exception is Area 4, where “1. Potential to Exceed Innate Limitations” shows up repeatedly as the top item.
+
+```{r}
+# Hierarchical clustering on Area–Area distance
+dist_mat <- as.dist(1 - abs(area_corr_adj))
+
+hc <- hclust(dist_mat, method = "average")
+
+plot(
+  hc,
+  main = "Hierarchical Clustering of Areas",
+  xlab = "Area",
+  sub = "",
+  hang = -1
+)
+
+# Optional: draw 2 clusters
+rect.hclust(hc, k = 2, border = "red")
+
+```
+
+Height = 1 − \|correlation\|, means how much difference you have to tolerate before treating two areas as the same group. A small height means the two areas behave very similarly. Overall, hierarchical clustering based on area–area correlations shows a clear separation of Area 1 from the remaining areas. While Areas 2–9 cluster tightly together, indicating highly similar patterns across individuals, Area 1 follows a distinct correlation structure.
+
+## Thoughts
+
+Now, given all these patterns in the data, are you curious about your own SOC level — and what might be holding you back from reaching SOC = 14 for an escape?
+
+## Disclaimer
+
+This report is for exploratory and interest purposes only. The interpretations and statistical summaries may not fully reflect the true characteristics of the underlying sample. Please apply discernment. Happy reading!
